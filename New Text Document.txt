@@ -1,0 +1,425 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import sqlite3
+import plotly.graph_objects as go
+from datetime import datetime
+
+st.set_page_config(layout="wide")
+st.title("Insurance Executive Analytics Dashboard")
+
+# =========================================================
+# DATABASE CONNECTION
+# =========================================================
+conn = sqlite3.connect("insurance.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# =========================================================
+# DATABASE CONTROL
+# =========================================================
+st.sidebar.subheader("Database Control")
+
+confirm_clear = st.sidebar.checkbox("Confirm Clear Database")
+if confirm_clear:
+    if st.sidebar.button("Clear All Data"):
+        cursor.execute("DROP TABLE IF EXISTS claims")
+        conn.commit()
+        st.sidebar.success("Database cleared.")
+        st.stop()
+
+# =========================================================
+# FILE UPLOAD
+# =========================================================
+uploaded_file = st.file_uploader("Upload Monthly Excel File", type=["xlsx"])
+
+if uploaded_file:
+    df_upload = pd.read_excel(uploaded_file)
+    df_upload.columns = df_upload.columns.str.strip()
+
+    for col in ["Requested Amount", "Accepted Amount"]:
+        df_upload[col] = (
+            df_upload[col]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace(" ", "", regex=False)
+        )
+        df_upload[col] = pd.to_numeric(df_upload[col], errors="coerce")
+
+    df_upload.to_sql("claims", conn, if_exists="append", index=False)
+    st.success("Data uploaded successfully.")
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='claims'")
+if not cursor.fetchone():
+    st.warning("Upload first file.")
+    st.stop()
+
+df = pd.read_sql("SELECT * FROM claims", conn)
+
+if df.empty:
+    st.warning("Database empty.")
+    st.stop()
+
+# Ensure numeric
+for col in ["Requested Amount", "Accepted Amount"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Convert Accident Date safely
+if "Accident Date" in df.columns:
+    df["Accident Date"] = pd.to_datetime(df["Accident Date"], errors="coerce")
+
+# =========================================================
+# OPTIONAL FILTERS
+# =========================================================
+st.sidebar.subheader("Filters (Optional)")
+filtered_df = df.copy()
+
+for label in ["Month","Approval Type","Claim Form Type","Client Name","Treatment Doctor"]:
+    selected = st.sidebar.multiselect(label, sorted(df[label].astype(str).unique()))
+    if selected:
+        filtered_df = filtered_df[filtered_df[label].astype(str).isin(selected)]
+
+# =========================================================
+# ACCOUNTING FORMAT
+# =========================================================
+def acc(x):
+    if pd.isna(x):
+        return "-"
+    return f"{x:,.0f}"
+
+# =========================================================
+# CORE KPIs
+# =========================================================
+total_requested = filtered_df["Requested Amount"].sum()
+total_accepted = filtered_df["Accepted Amount"].sum()
+claims_count = filtered_df["Approval ID"].count()
+
+unique_members = filtered_df["Insured Card No"].nunique()
+
+avg_cost_per_claim = total_requested / claims_count if claims_count else 0
+avg_cost_per_member = total_requested / unique_members if unique_members else 0
+approval_rate = (total_accepted / total_requested * 100) if total_requested else 0
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Requested", acc(total_requested))
+col2.metric("Total Accepted", acc(total_accepted))
+col3.metric("Claims Count", claims_count)
+
+col4, col5, col6 = st.columns(3)
+col4.metric("Avg Cost per Claim", acc(avg_cost_per_claim))
+col5.metric("Avg Cost per Member", acc(avg_cost_per_member))
+col6.metric("Approval Rate %", f"{approval_rate:.2f}%")
+
+st.markdown("---")
+
+# =========================================================
+# REQUESTED VS ACCEPTED BY APPROVAL TYPE
+# =========================================================
+st.subheader("Requested vs Accepted - Pre Authorization vs Regular")
+
+approval_comp = (
+    filtered_df.groupby("Approval Type")[["Requested Amount","Accepted Amount"]]
+    .sum()
+    .reset_index()
+)
+
+fig_comp = go.Figure()
+fig_comp.add_bar(x=approval_comp["Approval Type"],
+                 y=approval_comp["Requested Amount"],
+                 name="Requested Amount")
+fig_comp.add_bar(x=approval_comp["Approval Type"],
+                 y=approval_comp["Accepted Amount"],
+                 name="Accepted Amount")
+fig_comp.update_layout(barmode='group')
+
+st.plotly_chart(fig_comp, use_container_width=True)
+
+# =========================================================
+# APPROVAL TYPE PERCENTAGE
+# =========================================================
+st.subheader("Approval Type Percentage Distribution")
+
+approval_counts = (
+    filtered_df["Approval Type"]
+    .value_counts(normalize=True)
+    .reset_index()
+)
+
+approval_counts.columns = ["Approval Type", "Percentage"]
+
+fig_pie = px.pie(approval_counts,
+                 names="Approval Type",
+                 values="Percentage")
+
+st.plotly_chart(fig_pie, use_container_width=True)
+
+# =========================================================
+# CLAIM TYPE BREAKDOWN
+# =========================================================
+st.subheader("Claim Type Breakdown (Accepted Amount)")
+
+claim_break = (
+    filtered_df.groupby("Claim Form Type")["Accepted Amount"]
+    .sum()
+    .reset_index()
+)
+
+fig_claim = px.bar(claim_break,
+                   x="Claim Form Type",
+                   y="Accepted Amount",
+                   text_auto=True)
+
+st.plotly_chart(fig_claim, use_container_width=True)
+
+# =========================================================
+# TIME SERIES - MONTHLY TREND
+# =========================================================
+st.subheader("Monthly Time Series Trend")
+
+if "Accident Date" in filtered_df.columns:
+    ts_df = filtered_df.dropna(subset=["Accident Date"]).copy()
+
+    ts_df["YearMonth"] = ts_df["Accident Date"].dt.to_period("M")
+
+    monthly_trend = (
+        ts_df.groupby("YearMonth")[["Requested Amount","Accepted Amount"]]
+        .sum()
+        .reset_index()
+        .sort_values("YearMonth")
+    )
+
+    monthly_trend["YearMonth"] = monthly_trend["YearMonth"].astype(str)
+
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(
+        x=monthly_trend["YearMonth"],
+        y=monthly_trend["Requested Amount"],
+        mode='lines+markers',
+        name="Requested"
+    ))
+    fig_trend.add_trace(go.Scatter(
+        x=monthly_trend["YearMonth"],
+        y=monthly_trend["Accepted Amount"],
+        mode='lines+markers',
+        name="Accepted"
+    ))
+
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+# =========================================================
+# DOCTOR PERFORMANCE
+# =========================================================
+st.subheader("Doctor Performance")
+
+doctor_perf = (
+    filtered_df.groupby("Treatment Doctor")
+    .agg({
+        "Requested Amount":"sum",
+        "Accepted Amount":"sum",
+        "Approval ID":"count"
+    })
+    .rename(columns={"Approval ID":"Total Claims"})
+    .reset_index()
+)
+
+counts = (
+    filtered_df.groupby(["Treatment Doctor","Approval Type"])
+    .size()
+    .unstack(fill_value=0)
+    .reset_index()
+)
+
+doctor_perf = doctor_perf.merge(counts, on="Treatment Doctor", how="left")
+
+doctor_perf["Avg Cost per Claim"] = (
+    doctor_perf["Requested Amount"] /
+    doctor_perf["Total Claims"]
+)
+
+denominator = doctor_perf.get("Pre-Authorization",0) + doctor_perf.get("Regular",0)
+doctor_perf["Online %"] = np.where(
+    denominator != 0,
+    (doctor_perf.get("Pre-Authorization",0) / denominator) * 100,
+    0
+)
+
+doctor_perf = doctor_perf.sort_values("Accepted Amount", ascending=False)
+
+doctor_display = doctor_perf.copy()
+doctor_display["Requested Amount"] = doctor_display["Requested Amount"].apply(acc)
+doctor_display["Accepted Amount"] = doctor_display["Accepted Amount"].apply(acc)
+doctor_display["Avg Cost per Claim"] = doctor_display["Avg Cost per Claim"].round(0).apply(acc)
+doctor_display["Online %"] = doctor_display["Online %"].round(2).astype(str) + " %"
+
+doctor_display.index = range(1, len(doctor_display)+1)
+
+st.dataframe(doctor_display)
+
+# =========================================================
+# CLIENT PERFORMANCE
+# =========================================================
+st.subheader("Client Performance Ranking")
+
+client_perf = (
+    filtered_df.groupby("Client Name")
+    .agg({
+        "Requested Amount":"sum",
+        "Accepted Amount":"sum",
+        "Approval ID":"count"
+    })
+    .rename(columns={"Approval ID":"Total Claims"})
+    .reset_index()
+)
+
+client_counts = (
+    filtered_df.groupby(["Client Name","Approval Type"])
+    .size()
+    .unstack(fill_value=0)
+    .reset_index()
+)
+
+client_perf = client_perf.merge(client_counts, on="Client Name", how="left")
+
+client_perf["Avg Cost per Claim"] = (
+    client_perf["Requested Amount"] /
+    client_perf["Total Claims"]
+)
+
+denominator_c = client_perf.get("Pre-Authorization",0) + client_perf.get("Regular",0)
+client_perf["Online %"] = np.where(
+    denominator_c != 0,
+    (client_perf.get("Pre-Authorization",0) / denominator_c) * 100,
+    0
+)
+
+client_perf = client_perf.sort_values("Accepted Amount", ascending=False)
+
+client_display = client_perf.copy()
+client_display["Requested Amount"] = client_display["Requested Amount"].apply(acc)
+client_display["Accepted Amount"] = client_display["Accepted Amount"].apply(acc)
+client_display["Avg Cost per Claim"] = client_display["Avg Cost per Claim"].round(0).apply(acc)
+client_display["Online %"] = client_display["Online %"].round(2).astype(str) + " %"
+
+client_display.index = range(1, len(client_display)+1)
+
+st.dataframe(client_display)
+
+# =========================================================
+# =========================================================
+# TOP 20 CLIENT MEMBERS (Detailed by Card & Name)
+# =========================================================
+st.subheader("Top 20 Client Members - Detailed")
+
+top_client_members = (
+    filtered_df.groupby(
+        ["Client Name", "Insured Card No", "Insured Full Name"]
+    )
+    .agg({
+        "Requested Amount": "sum",
+        "Accepted Amount": "sum",
+        "Approval ID": "count"
+    })
+    .rename(columns={"Approval ID": "Total Claims"})
+    .reset_index()
+)
+
+# Count Pre / Regular
+counts = (
+    filtered_df.groupby(
+        ["Client Name", "Insured Card No", "Insured Full Name", "Approval Type"]
+    )
+    .size()
+    .unstack(fill_value=0)
+    .reset_index()
+)
+
+top_client_members = top_client_members.merge(
+    counts,
+    on=["Client Name", "Insured Card No", "Insured Full Name"],
+    how="left"
+)
+
+# Avg Cost per Claim
+top_client_members["Avg Cost per Claim"] = (
+    top_client_members["Requested Amount"] /
+    top_client_members["Total Claims"]
+)
+
+# Online %
+den = top_client_members.get("Pre-Authorization",0) + top_client_members.get("Regular",0)
+top_client_members["Online %"] = np.where(
+    den != 0,
+    (top_client_members.get("Pre-Authorization",0) / den) * 100,
+    0
+)
+
+# Sort by Accepted
+top_client_members = (
+    top_client_members
+    .sort_values("Accepted Amount", ascending=False)
+    .head(20)
+)
+
+# Display Formatting
+display_df = top_client_members.copy()
+display_df["Requested Amount"] = display_df["Requested Amount"].apply(acc)
+display_df["Accepted Amount"] = display_df["Accepted Amount"].apply(acc)
+display_df["Avg Cost per Claim"] = display_df["Avg Cost per Claim"].round(0).apply(acc)
+display_df["Online %"] = display_df["Online %"].round(2).astype(str) + " %"
+
+display_df.index = range(1, len(display_df)+1)
+
+st.dataframe(display_df)
+
+
+# =========================================================
+# TOP 10 PROVIDERS (DETAILED)
+# =========================================================
+st.subheader("Top 10 Providers - Detailed Performance")
+
+top_providers = (
+    filtered_df.groupby("Provider Name")
+    .agg({
+        "Requested Amount":"sum",
+        "Accepted Amount":"sum",
+        "Approval ID":"count"
+    })
+    .rename(columns={"Approval ID":"Total Claims"})
+    .reset_index()
+)
+
+provider_counts = (
+    filtered_df.groupby(["Provider Name","Approval Type"])
+    .size()
+    .unstack(fill_value=0)
+    .reset_index()
+)
+
+top_providers = top_providers.merge(provider_counts, on="Provider Name", how="left")
+
+top_providers["Avg Cost per Claim"] = (
+    top_providers["Requested Amount"] /
+    top_providers["Total Claims"]
+)
+
+den2 = top_providers.get("Pre-Authorization",0) + top_providers.get("Regular",0)
+top_providers["Online %"] = np.where(
+    den2 != 0,
+    (top_providers.get("Pre-Authorization",0) / den2) * 100,
+    0
+)
+
+top_providers = top_providers.sort_values("Accepted Amount", ascending=False).head(10)
+
+top_providers_display = top_providers.copy()
+top_providers_display["Requested Amount"] = top_providers_display["Requested Amount"].apply(acc)
+top_providers_display["Accepted Amount"] = top_providers_display["Accepted Amount"].apply(acc)
+top_providers_display["Avg Cost per Claim"] = top_providers_display["Avg Cost per Claim"].round(0).apply(acc)
+top_providers_display["Online %"] = top_providers_display["Online %"].round(2).astype(str) + " %"
+
+top_providers_display.index = range(1, len(top_providers_display)+1)
+
+st.dataframe(top_providers_display)
